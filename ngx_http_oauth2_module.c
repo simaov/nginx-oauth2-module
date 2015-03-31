@@ -20,11 +20,11 @@ static ngx_int_t ngx_http_oauth2_handler(ngx_http_request_t *r) {
 	r->main->internal = 1;
 	
 	ngx_table_elt_t *h;
-    h = ngx_list_push(&r->headers_out.headers);
-    h->hash = 1;
-    ngx_str_set(&h->key, "Location");
-    ngx_str_set(&h->value, "http://google.com");
-    	
+	h = ngx_list_push(&r->headers_out.headers);
+	h->hash = 1;
+	ngx_str_set(&h->key, "Location");
+	ngx_str_set(&h->value, "http://google.com");
+
 	return NGX_HTTP_MOVED_TEMPORARILY;
 }
 
