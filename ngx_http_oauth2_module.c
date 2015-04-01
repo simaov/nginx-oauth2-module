@@ -19,8 +19,6 @@ typedef struct {
     ngx_str_t oauth2_scope;						// optional
 } oauth2_main_conf_t;
 
-
-
 static ngx_command_t ngx_http_oauth2_commands[] = {
     {
         ngx_string("oauth2_authorization_endpoint"),
@@ -83,13 +81,10 @@ static ngx_int_t ngx_http_oauth2_handler(ngx_http_request_t *r) {
 	oauth2_main_conf_t *conf = ngx_http_get_module_main_conf(r, ngx_http_oauth2_module);
 
     ngx_str_t *authorization_endpoint 	= &conf->oauth2_authorization_endpoint;
-    // ngx_str_t *token_endpoint 			= &conf->oauth2_token_endpoint;
     ngx_str_t *response_type 			= &conf->oauth2_response_type;
     ngx_str_t *client_id 				= &conf->oauth2_client_id;
     ngx_str_t *redirect_uri 			= &conf->oauth2_redirect_uri;
     ngx_str_t *scope 					= &conf->oauth2_scope;
-    // ngx_str_t *state 					= &conf->oauth2_state;
-    // ngx_str_t *access_type 				= &conf->oauth2_access_type;
 
     int request_string_len = authorization_endpoint->len 
                                 + response_type->len + sizeof(RESPONSE_TYPE) + 1 
