@@ -7,8 +7,10 @@
 #include <uuid/uuid.h>
 #include <arpa/inet.h>
 #include "jsmn.h"
+#include "uthash.h"
 
-ngx_module_t ngx_http_oauth2_module;
+#define REQUEST_TYPE_POST 0
+#define REQUEST_TYPE_GET 1
 
 typedef struct {
     ngx_str_t oauth2_authorization_endpoint; 
@@ -20,7 +22,9 @@ typedef struct {
     ngx_str_t oauth2_scope;                  
 
     ngx_str_t oauth2_authorization_endpoint_request_url;
-    ngx_str_t oauth2_token_endpoint_endpoint_post;
+    ngx_str_t oauth2_token_endpoint_post;
+
+    ngx_str_t allow_emails_file;
 } ngx_http_oauth2_main_conf_t;
 
 typedef struct {
@@ -28,15 +32,41 @@ typedef struct {
 } ngx_http_oauth2_srv_conf_t;
 
 typedef struct {
-  ngx_str_t string;
-  ngx_http_request_t *r;
+    ngx_str_t string;
+    ngx_http_request_t *r;
 } string_request_wrapper_t;
+
+typedef struct {
+    ngx_str_t access_token;
+    ngx_str_t token_type;
+    ngx_int_t expires_in;
+} access_token_response_t;
+
+typedef struct {
+    ngx_str_t email;
+} user_info_response_t;
+
+typedef struct {
+    char *user_uuid;
+    char *user_email;
+    UT_hash_handle hh;
+} user_hash_t;
+
+typedef struct {
+    char *user_email;
+    UT_hash_handle hh;
+} user_email_hash_t;
+
+
+ngx_module_t ngx_http_oauth2_module;
+ngx_pool_t *cyrcle_pool;
+user_hash_t *user_hash = NULL;
+user_email_hash_t *user_email_hash = NULL;
 
 static ngx_str_t sendRequestToOauth2TokenEndpoint(ngx_http_request_t *r, ngx_http_oauth2_main_conf_t *cf);
 static size_t writefunc(void *ptr, size_t size, size_t nmemb, string_request_wrapper_t *wrapper);
 static ngx_str_t getVariableFromQueryString(ngx_str_t *var, ngx_http_request_t *r);
-static void sendCurlPostRequest(u_char *dst, u_char *post_data, string_request_wrapper_t *wrapper);
-static ngx_str_t *getJsonProperty(ngx_str_t *json, const char *property, ngx_http_request_t *r);
+static ngx_int_t sendCurlRequest(u_char *dst, u_char *post_data, ngx_int_t requestType, string_request_wrapper_t *wrapper);
 static ngx_str_t *getRandomUuidString(ngx_http_request_t *r);
 static int isRedirect(ngx_str_t *configRedirectString, ngx_http_request_t *r);
 static u_char *ngx_memcpy_e(u_char *dst, u_char *src, size_t len);
@@ -46,14 +76,14 @@ static ngx_int_t setCookie(ngx_str_t *cookieName, ngx_str_t *cookieValue, ngx_ht
 static ngx_int_t getCookie(ngx_str_t *cookieName, ngx_str_t *cookieValue, ngx_http_request_t *r);
 
 static ngx_str_t *getServerAddr(ngx_http_request_t *r);
+static ngx_int_t processAccessTokenResponse(ngx_str_t *accessTokenResponseJson, access_token_response_t *access_token_response, ngx_http_request_t *req);
 
-static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
-    if (tok->type == JSMN_STRING && (int) strlen(s) == tok->end - tok->start &&
-            strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
-        return 0;
-    }
-    return -1;
-}
+static ngx_int_t getUserInfo(u_char *dst, user_info_response_t *user_info_response, ngx_http_request_t *r);
+static ngx_int_t processUserInfoResponse(ngx_str_t *json, user_info_response_t *user_info_response, ngx_http_request_t *req);
+static void add_user(ngx_str_t *user_uuid, ngx_str_t *email, ngx_http_request_t *r);
+static user_hash_t *find_user(u_char *user_uuid, ngx_http_request_t *r);
+static void add_email(ngx_str_t *email, ngx_pool_t *pool, ngx_log_t *log);
+static user_email_hash_t *find_email(u_char *user_email, ngx_log_t *log);
 
 static ngx_command_t ngx_http_oauth2_commands[] = {
     {
@@ -120,6 +150,14 @@ static ngx_command_t ngx_http_oauth2_commands[] = {
         offsetof(ngx_http_oauth2_main_conf_t, oauth2_scope),
         NULL
     },
+    {
+        ngx_string("allow_emails_file"),
+        NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_oauth2_main_conf_t, allow_emails_file),
+        NULL
+    },
     ngx_null_command
 };
 
@@ -148,28 +186,28 @@ static char* ngx_http_oauth2_init_main_conf(ngx_conf_t *cf, void *conf) {
                 + main_conf->oauth2_redirect_uri.len + redirect_uri.len
                 + main_conf->oauth2_scope.len + scope.len
                 + 1    // 1 * ?
-                + 3    // 3 * &
-                + 1;   // '\0'
+                + 3;   // 3 * &
     
-    main_conf->oauth2_authorization_endpoint_request_url.data = ngx_pnalloc(cf->pool, url_len);
+    main_conf->oauth2_authorization_endpoint_request_url.data = ngx_pnalloc(cf->pool, url_len + 1);
     if (main_conf->oauth2_authorization_endpoint_request_url.data == NULL) {
         return NGX_CONF_ERROR;
     }
-
-    strncpy((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) main_conf->oauth2_authorization_endpoint.data, main_conf->oauth2_authorization_endpoint.len);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, "?");
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) client_id.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) main_conf->oauth2_client_id.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, "&");
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) response_type.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) main_conf->oauth2_response_type.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, "&");
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) redirect_uri.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) main_conf->oauth2_redirect_uri.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, "&");
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) scope.data);
-    strcat((char *) main_conf->oauth2_authorization_endpoint_request_url.data, (char *) main_conf->oauth2_scope.data);
-    main_conf->oauth2_authorization_endpoint_request_url.len = url_len - 1;
+    u_char *p = ngx_memcpy_e(main_conf->oauth2_authorization_endpoint_request_url.data, 
+        main_conf->oauth2_authorization_endpoint.data, main_conf->oauth2_authorization_endpoint.len);
+    p = ngx_memcpy_e(p, (u_char *) "?", sizeof("?") - 1);
+    p = ngx_memcpy_e(p, client_id.data, client_id.len);
+    p = ngx_memcpy_e(p, main_conf->oauth2_client_id.data, main_conf->oauth2_client_id.len);
+    p = ngx_memcpy_e(p, (u_char *) "&", sizeof("&") - 1);
+    p = ngx_memcpy_e(p, response_type.data, response_type.len);
+    p = ngx_memcpy_e(p, main_conf->oauth2_response_type.data, main_conf->oauth2_response_type.len);
+    p = ngx_memcpy_e(p, (u_char *) "&", sizeof("&") - 1);
+    p = ngx_memcpy_e(p, redirect_uri.data, redirect_uri.len);
+    p = ngx_memcpy_e(p, main_conf->oauth2_redirect_uri.data, main_conf->oauth2_redirect_uri.len);
+    p = ngx_memcpy_e(p, (u_char *) "&", sizeof("&") - 1);
+    p = ngx_memcpy_e(p, scope.data, scope.len);
+    p = ngx_memcpy_e(p, main_conf->oauth2_scope.data, main_conf->oauth2_scope.len);
+    main_conf->oauth2_authorization_endpoint_request_url.data[url_len] = '\0';
+    main_conf->oauth2_authorization_endpoint_request_url.len = url_len;
 
     ngx_str_t client_secret = ngx_string("client_secret=");
     
@@ -177,30 +215,58 @@ static char* ngx_http_oauth2_init_main_conf(ngx_conf_t *cf, void *conf) {
                 + main_conf->oauth2_client_secret.len + client_secret.len 
                 + main_conf->oauth2_redirect_uri.len + redirect_uri.len
                 + 3  // 3 * &
-                + strlen("grant_type=authorization_code");
+                + sizeof("grant_type=authorization_code") - 1;
     
-    main_conf->oauth2_token_endpoint_endpoint_post.data = ngx_pnalloc(cf->pool, post_len + 1);
-    if (main_conf->oauth2_token_endpoint_endpoint_post.data == NULL) {
+    main_conf->oauth2_token_endpoint_post.data = ngx_pnalloc(cf->pool, post_len + 1);
+    if (main_conf->oauth2_token_endpoint_post.data == NULL) {
         return NGX_CONF_ERROR;
     } 
-    u_char *p = ngx_memcpy_e(main_conf->oauth2_token_endpoint_endpoint_post.data, client_id.data, client_id.len);
-    p = ngx_memcpy_e(p, main_conf->oauth2_client_id.data, main_conf->oauth2_client_id.len);
-    p = ngx_memcpy_e(p, (u_char *) "&", sizeof("&") - 1);
-    p = ngx_memcpy_e(p, client_secret.data, client_secret.len);
-    p = ngx_memcpy_e(p, main_conf->oauth2_client_secret.data, main_conf->oauth2_client_secret.len);
-    p = ngx_memcpy_e(p, (u_char *) "&", sizeof("&") - 1);
-    p = ngx_memcpy_e(p, redirect_uri.data, redirect_uri.len);
-    p = ngx_memcpy_e(p, main_conf->oauth2_redirect_uri.data, main_conf->oauth2_redirect_uri.len);
-    p = ngx_memcpy_e(p, (u_char *) "&grant_type=authorization_code", sizeof("&grant_type=authorization_code") - 1);
-    main_conf->oauth2_token_endpoint_endpoint_post.data[post_len] = '\0';
-    main_conf->oauth2_token_endpoint_endpoint_post.len = post_len;
+    u_char *pp = ngx_memcpy_e(main_conf->oauth2_token_endpoint_post.data, client_id.data, client_id.len);
+    pp = ngx_memcpy_e(pp, main_conf->oauth2_client_id.data, main_conf->oauth2_client_id.len);
+    pp = ngx_memcpy_e(pp, (u_char *) "&", sizeof("&") - 1);
+    pp = ngx_memcpy_e(pp, client_secret.data, client_secret.len);
+    pp = ngx_memcpy_e(pp, main_conf->oauth2_client_secret.data, main_conf->oauth2_client_secret.len);
+    pp = ngx_memcpy_e(pp, (u_char *) "&", sizeof("&") - 1);
+    pp = ngx_memcpy_e(pp, redirect_uri.data, redirect_uri.len);
+    pp = ngx_memcpy_e(pp, main_conf->oauth2_redirect_uri.data, main_conf->oauth2_redirect_uri.len);
+    pp = ngx_memcpy_e(pp, (u_char *) "&grant_type=authorization_code", sizeof("&grant_type=authorization_code") - 1);
+    main_conf->oauth2_token_endpoint_post.data[post_len] = '\0';
+    main_conf->oauth2_token_endpoint_post.len = post_len;
     
-    return NGX_CONF_OK;
-}
+    FILE* file = fopen((char *) main_conf->allow_emails_file.data, "r");
+    if (file == NULL) {
+        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "Failed to open email file.");
+        return NGX_CONF_OK;
+    } 
 
-u_char *ngx_memcpy_e(u_char *dst, u_char *src, size_t len) {
-    ngx_memcpy(dst, src, len);
-    return dst + len;
+    u_char line[256];
+    char c;
+    int count = 0;
+    while ((c = fgetc(file)) != EOF) {
+        if (c == '\n') {
+            line[count] = '\0';
+            
+            ngx_str_t *email = ngx_pnalloc(cf->pool, sizeof(ngx_str_t));
+            email->data = ngx_pnalloc(cf->pool, count + 1);
+            ngx_memcpy(email->data, &line, count);
+            email->len = count;
+            
+            add_email(email, cf->pool, cf->log);
+            
+            ngx_log_error(NGX_LOG_ERR, cf->log, 0, "Add email: %s", email->data);
+            
+            count = 0;
+            ngx_memzero(line, 256); 
+        } else {
+            line[count] = (u_char) c;
+            count++;
+        }
+        
+    }
+
+    fclose(file);
+
+    return NGX_CONF_OK;
 }
 
 static void *ngx_http_oauth2_create_srv_conf(ngx_conf_t *cf) {
@@ -250,15 +316,38 @@ static ngx_int_t ngx_http_oauth2_handler(ngx_http_request_t *r) {
         }
         
 
-        ngx_str_t response = sendRequestToOauth2TokenEndpoint(r, config);    
-        ngx_str_t *accessToken = getJsonProperty(&response, "access_token", r);
+        ngx_str_t response = sendRequestToOauth2TokenEndpoint(r, config);
+        
+        access_token_response_t access_token_response;
+        if(processAccessTokenResponse(&response, &access_token_response, r) != NGX_OK){
+            return NGX_ERROR;
+        }   
+
+        ngx_str_t userInfoUrl = ngx_string("https://www.googleapis.com/oauth2/v3/userinfo?alt=json&access_token=");
+        u_char *fullUserInfoUrl = ngx_pnalloc(r->pool, userInfoUrl.len + access_token_response.access_token.len + 1);
+        ngx_memcpy(fullUserInfoUrl, userInfoUrl.data, userInfoUrl.len);
+        ngx_memcpy(fullUserInfoUrl + userInfoUrl.len, access_token_response.access_token.data, access_token_response.access_token.len);
+        fullUserInfoUrl[userInfoUrl.len + access_token_response.access_token.len] = '\0';
+
+        user_info_response_t user_info_response;
+        if(getUserInfo(fullUserInfoUrl, &user_info_response, r) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+        ngx_str_t state_param_key = ngx_string("state");
+        ngx_str_t state_param_value = getVariableFromQueryString(&state_param_key, r);
+        
+        
+        add_user(&state_param_value, &user_info_response.email, r);
+
 
         // START: set access_token cookie
-        ngx_str_t accessTokenCookieName = ngx_string("access_token");
-        if(setCookie(&accessTokenCookieName, accessToken, r) != NGX_OK) {
+        ngx_str_t accessTokenCookieName = ngx_string("user_uuid");
+        if(setCookie(&accessTokenCookieName, &state_param_value, r) != NGX_OK) {
             return NGX_ERROR;
         }
         // END: set access_token cookie
+
 
         // START: set Location header
         int orgUrlLen = serverAddr->len + orgUriCookieValue.len;
@@ -279,9 +368,24 @@ static ngx_int_t ngx_http_oauth2_handler(ngx_http_request_t *r) {
     } else {
         
         ngx_str_t cookie_value;
-        ngx_str_t cookie_name = ngx_string("access_token");
+        ngx_str_t cookie_name = ngx_string("user_uuid");
         ngx_int_t cookie_location = getCookie(&cookie_name, &cookie_value, r);
         
+        if (cookie_location != NGX_DECLINED) {
+            user_hash_t *uh = find_user(cookie_value.data, r);
+            if(uh != NULL) {
+                if (find_email((u_char *) uh->user_email, r->connection->log) != NULL) {
+                    return NGX_DECLINED;
+                } else {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "EMAIL NOT FOUND");
+                    return NGX_HTTP_NOT_ALLOWED;
+                }
+                
+            } else {
+                cookie_location = NGX_DECLINED;
+            }
+        }
+
         if (cookie_location == NGX_DECLINED) {
             
             ngx_str_t *uuidString = getRandomUuidString(r);
@@ -334,6 +438,7 @@ static ngx_int_t ngx_http_oauth2_init(ngx_conf_t *cf) {
 
 static ngx_int_t ngx_http_oauth2_init_module(ngx_cycle_t *cycle) {
     curl_global_init(CURL_GLOBAL_ALL);
+    cyrcle_pool = cycle->pool; 
     return NGX_OK;
 }
 
@@ -367,58 +472,108 @@ ngx_module_t ngx_http_oauth2_module = {
     NGX_MODULE_V1_PADDING 
 };
 
-static ngx_str_t sendRequestToOauth2TokenEndpoint(ngx_http_request_t *r, ngx_http_oauth2_main_conf_t *cf) {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "IN: sendRequestToOauth2TokenEndpoint");
+static int jsoneq(const char *json, jsmntok_t *tok, const char *s) {
+    if (tok->type == JSMN_STRING && (int) strlen(s) == tok->end - tok->start &&
+            strncmp(json + tok->start, s, tok->end - tok->start) == 0) {
+        return 0;
+    }
+    return -1;
+}
+
+u_char *ngx_memcpy_e(u_char *dst, u_char *src, size_t len) {
+    ngx_memcpy(dst, src, len);
+    return dst + len;
+}
+
+static ngx_int_t getUserInfo(u_char *dst, user_info_response_t *user_info_response, ngx_http_request_t *r) {
+    ngx_str_t str = ngx_string("");
+    string_request_wrapper_t wrapper = {str, r};
+    if(sendCurlRequest(dst, NULL, REQUEST_TYPE_GET, &wrapper) != NGX_OK) {
+        return NGX_ERROR;
+    }
+
+    if(processUserInfoResponse(&wrapper.string, user_info_response, r) != NGX_OK) {
+        return NGX_ERROR;    
+    }
+    return NGX_OK;
+}
+
+static ngx_int_t processUserInfoResponse(ngx_str_t *json, user_info_response_t *user_info_response, ngx_http_request_t *req) {
+    int i;
+    int r;
+    jsmn_parser p;
+    jsmntok_t t[25]; 
     
+    jsmn_init(&p);
+    r = jsmn_parse(&p, (char *) json->data, json->len, t, sizeof(t)/sizeof(t[0]));
+    if (r < 0) {
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0, "Failed to parse JSON: %d", r);
+        return NGX_ERROR;
+    }
+
+    /* Assume the top-level element is an object */
+    if (r < 1 || t[0].type != JSMN_OBJECT) {
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0, "Object expected");
+        return NGX_ERROR;
+    }
+
+    /* Loop over all keys of the root object */
+    for (i = 1; i < r; i++) {
+        if (jsoneq((char *) json->data, &t[i], "email") == 0) {
+            int len = t[i+1].end-t[i+1].start;
+            user_info_response->email.data = ngx_pnalloc(req->pool, len + 1);
+            ngx_memcpy(user_info_response->email.data, json->data + t[i+1].start, len);
+            user_info_response->email.data[len] = '\0';
+            user_info_response->email.len = len;
+            i++;
+        } 
+    }
+    return NGX_OK;
+}
+
+static ngx_str_t sendRequestToOauth2TokenEndpoint(ngx_http_request_t *r, ngx_http_oauth2_main_conf_t *cf) {
     ngx_str_t code_param_key = ngx_string("code");
     ngx_str_t code_param_value = getVariableFromQueryString(&code_param_key, r);
 
-    int post_len = cf->oauth2_token_endpoint_endpoint_post.len + strlen("&code=") + code_param_value.len;
+    size_t postLen = cf->oauth2_token_endpoint_post.len + sizeof("&code=") - 1 + code_param_value.len;
        
-    u_char *post = ngx_pnalloc(r->pool, post_len + 1);
-    u_char *p = ngx_memcpy_e(post, cf->oauth2_token_endpoint_endpoint_post.data, cf->oauth2_token_endpoint_endpoint_post.len);
+    u_char *post = ngx_pnalloc(r->pool, postLen + 1);
+    u_char *p = ngx_memcpy_e(post, cf->oauth2_token_endpoint_post.data, cf->oauth2_token_endpoint_post.len);
     p = ngx_memcpy_e(p, (u_char *) "&code=", sizeof("&code=") - 1);
     p = ngx_memcpy_e(p, code_param_value.data, code_param_value.len);
-    post[post_len] = '\0';
-    
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "sendRequestToOauth2TokenEndpoint, POST_VALUE: %s", post);
+    post[postLen] = '\0';
     
     ngx_str_t str = ngx_string("");
     string_request_wrapper_t wrapper = {str, r};
 
-    sendCurlPostRequest(cf->oauth2_token_endpoint.data, post, &wrapper); 
+    if(sendCurlRequest(cf->oauth2_token_endpoint.data, post, REQUEST_TYPE_POST, &wrapper) != NGX_OK) {
 
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OUT: sendRequestToOauth2TokenEndpoint, VALUE: %s", wrapper.string.data);
+    }
     return wrapper.string;
 }
 
 static ngx_str_t getVariableFromQueryString(ngx_str_t *variable, ngx_http_request_t *r) {
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "IN: getVariableFromQueryString");
+    size_t varLen = variable->len + sizeof("arg_") - 1;
     
-    int varLen = variable->len + sizeof("arg_") - 1;
-    u_char varData[varLen + 1];
-    ngx_memcpy(varData, (u_char *) "arg_", sizeof("arg_") - 1);
-    ngx_memcpy(varData + strlen("arg_"), variable->data, variable->len);
-    varData[varLen] = '\0';
-    
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "getVariableFromQueryString:varData: [%s]", varData);
-    
-    ngx_str_t argument = ngx_string(varData);
-    ngx_uint_t id_key = ngx_hash_key(argument.data, argument.len);
+    ngx_str_t argument;
+    argument.data = ngx_pnalloc(r->pool, varLen + 1);
+    ngx_memcpy(argument.data, (u_char *) "arg_", sizeof("arg_") - 1);
+    ngx_memcpy(argument.data + sizeof("arg_") - 1, variable->data, variable->len);
+    argument.data[varLen] = '\0';
+    argument.len = varLen;
 
+    ngx_uint_t id_key = ngx_hash_key(argument.data, argument.len);
     ngx_http_variable_value_t *variableValue = ngx_http_get_variable(r, &argument, id_key);
 
     ngx_str_t resultString = {0, NULL};
     if (variableValue != NULL && variableValue->not_found != 1) {
-        u_char *buffer = ngx_pnalloc(r->pool, variableValue->len + 1);
-        ngx_memcpy(buffer, variableValue->data, variableValue->len);
-        buffer[variableValue->len] = '\0';
+        resultString.data = ngx_pnalloc(r->pool, variableValue->len + 1);
+        ngx_memcpy(resultString.data, variableValue->data, variableValue->len);
+        resultString.data[variableValue->len] = '\0';
         resultString.len = variableValue->len;
-        resultString.data = (u_char *) buffer;
     }
 
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "getVariableFromQueryString, VALUE: %s", resultString.data);
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "OUT: getVariableFromQueryString");
     return resultString;
 }
 
@@ -438,64 +593,80 @@ static size_t writefunc(void *ptr, size_t size, size_t nmemb, string_request_wra
     return size*nmemb;
 }
 
-static void sendCurlPostRequest(u_char *dst, u_char *post_data, string_request_wrapper_t *wrapper) {
-    CURL *curl;
-    CURLcode res;
-         
-    curl = curl_easy_init();
+static ngx_int_t sendCurlRequest(u_char *dst, u_char *post_data, ngx_int_t requestType, string_request_wrapper_t *wrapper) {
+    CURL *curl = curl_easy_init();
     if(curl) {
-        
         curl_easy_setopt(curl, CURLOPT_URL, dst);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+        
+        if (requestType == REQUEST_TYPE_POST && post_data != NULL) {
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+        }
+        
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writefunc);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, wrapper);
-                
-        res = curl_easy_perform(curl);
-        if(res != CURLE_OK) {
-            ngx_log_error(NGX_LOG_ERR, wrapper->r->connection->log, 0, "===> CURL NOT OK!");
-
+        
+        if(curl_easy_perform(curl) != CURLE_OK) {
+            ngx_log_error(NGX_LOG_ERR, wrapper->r->connection->log, 0, "Cannot perform CURL request."); 
+            return NGX_ERROR;
         }   
-        ngx_log_error(NGX_LOG_ERR, wrapper->r->connection->log, 0, "DATA: %s, LEN: %d", wrapper->string.data, wrapper->string.len); 
+
         curl_easy_cleanup(curl);
+
+        return NGX_OK;
     }
+
+    ngx_log_error(NGX_LOG_ERR, wrapper->r->connection->log, 0, "Cannot initialize CURL ."); 
+    
+    return NGX_ERROR;
 }
 
-static ngx_str_t *getJsonProperty(ngx_str_t *json, const char *property, ngx_http_request_t *request) {
+static ngx_int_t processAccessTokenResponse(ngx_str_t *accessTokenResponseJson, access_token_response_t *access_token_response, ngx_http_request_t *req) {
     int i;
     int r;
     jsmn_parser p;
     jsmntok_t t[10]; 
-
-    ngx_str_t *result = ngx_pnalloc(request->pool, sizeof(ngx_str_t));
-    result->data = NULL;
-    result->len = 0;
-
+    
     jsmn_init(&p);
-    r = jsmn_parse(&p, (char *) json->data, json->len, t, sizeof(t)/sizeof(t[0]));
+    r = jsmn_parse(&p, (char *) accessTokenResponseJson->data, accessTokenResponseJson->len, t, sizeof(t)/sizeof(t[0]));
     if (r < 0) {
-        printf("Failed to parse JSON: %d\n", r);
-        return result;
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0, "Failed to parse JSON: %d", r);
+        return NGX_ERROR;
     }
 
     /* Assume the top-level element is an object */
     if (r < 1 || t[0].type != JSMN_OBJECT) {
-        printf("Object expected\n");
-        return result;
+        ngx_log_error(NGX_LOG_ERR, req->connection->log, 0, "Object expected");
+        return NGX_ERROR;
     }
 
     /* Loop over all keys of the root object */
     for (i = 1; i < r; i++) {
-        if (jsoneq((char *) json->data, &t[i], property) == 0) {
+        if (jsoneq((char *) accessTokenResponseJson->data, &t[i], "access_token") == 0) {
             int len = t[i+1].end-t[i+1].start;
-            result->data = ngx_pnalloc(request->pool, len + 1);
-            ngx_memcpy(result->data, json->data + t[i+1].start, len);
-            result->data[len] = '\0';
-            result->len = len;
+            access_token_response->access_token.data = ngx_pnalloc(req->pool, len + 1);
+            ngx_memcpy(access_token_response->access_token.data, accessTokenResponseJson->data + t[i+1].start, len);
+            access_token_response->access_token.data[len] = '\0';
+            access_token_response->access_token.len = len;
+            i++;
+        } else if (jsoneq((char *) accessTokenResponseJson->data, &t[i], "token_type") == 0) {
+            int len = t[i+1].end-t[i+1].start;
+            access_token_response->token_type.data = ngx_pnalloc(req->pool, len + 1);
+            ngx_memcpy(access_token_response->token_type.data, accessTokenResponseJson->data + t[i+1].start, len);
+            access_token_response->token_type.data[len] = '\0';
+            access_token_response->token_type.len = len;
+            i++;
+        } else if (jsoneq((char *) accessTokenResponseJson->data, &t[i], "expires_in") == 0) {
+            int len = t[i+1].end-t[i+1].start;
+            u_char *expires_in_str =  ngx_pnalloc(req->pool, len + 1);
+            ngx_memcpy(expires_in_str, accessTokenResponseJson->data + t[i+1].start, len);
+            expires_in_str[len] = '\0';
+            char *ptr;
+            access_token_response->expires_in = strtol((char *) expires_in_str, &ptr, 10);
             i++;
         }
     }
 
-    return result;
+    return NGX_OK;
 }
 
 static ngx_str_t *getRandomUuidString(ngx_http_request_t *r) {
@@ -517,7 +688,6 @@ static int isRedirect(ngx_str_t *configRedirectString, ngx_http_request_t *r) {
     ngx_memcpy(httpUrl, serverAddr->data, serverAddr->len);
     ngx_memcpy(httpUrl + serverAddr->len, r->uri.data, r->uri.len);
     httpUrl[urlLen] = '\0';
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "IN: isRedirect:httpUrl: [%s]", httpUrl);
     
     return !ngx_strncmp(configRedirectString->data, httpUrl, configRedirectString->len);
 }
@@ -578,4 +748,39 @@ static ngx_int_t setCookie(ngx_str_t *cookieName, ngx_str_t *cookieValue, ngx_ht
     return setHeader(&headerName, &headerValue, r);
 }
 
-// https://www.googleapis.com/oauth2/v3/userinfo?alt=json&access_token=ya29.UQFpwFrksQY-evJ9O9ZXLEuW_TJq4O1zAVMKzNV8K-x6F2_05pbit3gHjjBr-7OLX7jQL6VD6cU1NQ
+// work with user hash
+static void add_user(ngx_str_t *user_uuid, ngx_str_t *email, ngx_http_request_t *r) {
+    user_hash_t *hash = ngx_pnalloc(cyrcle_pool, sizeof(user_hash_t));
+    hash->user_uuid = ngx_pnalloc(cyrcle_pool, user_uuid->len + 1);
+    hash->user_email = ngx_pnalloc(cyrcle_pool, email->len + 1);
+    ngx_memcpy(hash->user_uuid, user_uuid->data, user_uuid->len);
+    hash->user_uuid[user_uuid->len]='\0';
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "hash->user_uuid: %s", hash->user_uuid);
+    ngx_memcpy(hash->user_email, email->data, email->len);
+    hash->user_email[email->len] = '\0';
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "hash->user_email: %s", hash->user_email);
+    HASH_ADD_KEYPTR(hh, user_hash, hash->user_uuid, user_uuid->len, hash);
+}
+
+static user_hash_t *find_user(u_char *user_uuid, ngx_http_request_t *r) {
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "user_uuid: %s", user_uuid);
+    user_hash_t *hash;
+    HASH_FIND_STR(user_hash, (char *) user_uuid, hash);  /* s: output pointer */
+    return hash;
+}
+
+
+// work with email hash
+static void add_email(ngx_str_t *email, ngx_pool_t *pool, ngx_log_t *log) {
+    user_email_hash_t *hash = ngx_pnalloc(pool, sizeof(user_email_hash_t));
+    hash->user_email = ngx_pnalloc(pool, email->len + 1);
+    ngx_memcpy(hash->user_email, email->data, email->len);
+    hash->user_email[email->len] = '\0';
+    HASH_ADD_KEYPTR(hh, user_email_hash, hash->user_email, email->len, hash);
+}
+
+static user_email_hash_t *find_email(u_char *user_email, ngx_log_t *log) {
+    user_email_hash_t *hash;
+    HASH_FIND_STR(user_email_hash, (char *) user_email, hash);
+    return hash;
+}
