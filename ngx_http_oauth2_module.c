@@ -65,7 +65,7 @@ user_email_hash_t *user_email_hash = NULL;
 
 static ngx_str_t sendRequestToOauth2TokenEndpoint(ngx_http_request_t *r, ngx_http_oauth2_main_conf_t *cf);
 static size_t writefunc(void *ptr, size_t size, size_t nmemb, string_request_wrapper_t *wrapper);
-static ngx_str_t getVariableFromQueryString(ngx_str_t *var, ngx_http_request_t *r);
+static ngx_str_t *getVariableFromQueryString(ngx_str_t *var, ngx_http_request_t *r);
 static ngx_int_t sendCurlRequest(u_char *dst, u_char *post_data, ngx_int_t requestType, string_request_wrapper_t *wrapper);
 static ngx_str_t *getRandomUuidString(ngx_http_request_t *r);
 static int isRedirect(ngx_str_t *configRedirectString, ngx_http_request_t *r);
@@ -235,7 +235,7 @@ static char* ngx_http_oauth2_init_main_conf(ngx_conf_t *cf, void *conf) {
     
     FILE* file = fopen((char *) main_conf->allow_emails_file.data, "r");
     if (file == NULL) {
-        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "Failed to open email file.");
+        ngx_log_error(NGX_LOG_ERR, cf->log, 0, "Failed to open email file [%s].", main_conf->allow_emails_file.data);
         return NGX_CONF_OK;
     } 
 
@@ -307,6 +307,16 @@ static ngx_int_t ngx_http_oauth2_handler(ngx_http_request_t *r) {
     ngx_http_oauth2_main_conf_t *config = ngx_http_get_module_main_conf(r, ngx_http_oauth2_module);
     
     if(isRedirect(&config->oauth2_redirect_uri, r)) {
+
+        // check if the user approves the access request
+        ngx_str_t error_param_key = ngx_string("error");
+        ngx_str_t *error_param_value = getVariableFromQueryString(&error_param_key, r);
+        if (error_param_value != NULL) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "ERROR: %s!", error_param_value->data);
+            return NGX_HTTP_NOT_ALLOWED;
+        }
+
+
         ngx_str_t orgUriCookieValue;
         ngx_str_t orgUriCookieName = ngx_string("org_uri");
         ngx_int_t orgUriCookieLocation = getCookie(&orgUriCookieName, &orgUriCookieValue, r);
@@ -335,15 +345,15 @@ static ngx_int_t ngx_http_oauth2_handler(ngx_http_request_t *r) {
         }
 
         ngx_str_t state_param_key = ngx_string("state");
-        ngx_str_t state_param_value = getVariableFromQueryString(&state_param_key, r);
+        ngx_str_t *state_param_value = getVariableFromQueryString(&state_param_key, r);
         
         
-        add_user(&state_param_value, &user_info_response.email, r);
+        add_user(state_param_value, &user_info_response.email, r);
 
 
         // START: set access_token cookie
         ngx_str_t accessTokenCookieName = ngx_string("user_uuid");
-        if(setCookie(&accessTokenCookieName, &state_param_value, r) != NGX_OK) {
+        if(setCookie(&accessTokenCookieName, state_param_value, r) != NGX_OK) {
             return NGX_ERROR;
         }
         // END: set access_token cookie
@@ -533,14 +543,14 @@ static ngx_int_t processUserInfoResponse(ngx_str_t *json, user_info_response_t *
 
 static ngx_str_t sendRequestToOauth2TokenEndpoint(ngx_http_request_t *r, ngx_http_oauth2_main_conf_t *cf) {
     ngx_str_t code_param_key = ngx_string("code");
-    ngx_str_t code_param_value = getVariableFromQueryString(&code_param_key, r);
+    ngx_str_t *code_param_value = getVariableFromQueryString(&code_param_key, r);
 
-    size_t postLen = cf->oauth2_token_endpoint_post.len + sizeof("&code=") - 1 + code_param_value.len;
+    size_t postLen = cf->oauth2_token_endpoint_post.len + sizeof("&code=") - 1 + code_param_value->len;
        
     u_char *post = ngx_pnalloc(r->pool, postLen + 1);
     u_char *p = ngx_memcpy_e(post, cf->oauth2_token_endpoint_post.data, cf->oauth2_token_endpoint_post.len);
     p = ngx_memcpy_e(p, (u_char *) "&code=", sizeof("&code=") - 1);
-    p = ngx_memcpy_e(p, code_param_value.data, code_param_value.len);
+    p = ngx_memcpy_e(p, code_param_value->data, code_param_value->len);
     post[postLen] = '\0';
     
     ngx_str_t str = ngx_string("");
@@ -552,7 +562,7 @@ static ngx_str_t sendRequestToOauth2TokenEndpoint(ngx_http_request_t *r, ngx_htt
     return wrapper.string;
 }
 
-static ngx_str_t getVariableFromQueryString(ngx_str_t *variable, ngx_http_request_t *r) {
+static ngx_str_t *getVariableFromQueryString(ngx_str_t *variable, ngx_http_request_t *r) {
     size_t varLen = variable->len + sizeof("arg_") - 1;
     
     ngx_str_t argument;
@@ -562,18 +572,19 @@ static ngx_str_t getVariableFromQueryString(ngx_str_t *variable, ngx_http_reques
     argument.data[varLen] = '\0';
     argument.len = varLen;
 
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "argument: [%s]", argument.data);
+
     ngx_uint_t id_key = ngx_hash_key(argument.data, argument.len);
     ngx_http_variable_value_t *variableValue = ngx_http_get_variable(r, &argument, id_key);
 
-    ngx_str_t resultString = {0, NULL};
+    ngx_str_t *resultString = NULL;
     if (variableValue != NULL && variableValue->not_found != 1) {
-        resultString.data = ngx_pnalloc(r->pool, variableValue->len + 1);
-        ngx_memcpy(resultString.data, variableValue->data, variableValue->len);
-        resultString.data[variableValue->len] = '\0';
-        resultString.len = variableValue->len;
+        resultString = ngx_pnalloc(r->pool, sizeof(ngx_str_t));
+        resultString->data = ngx_pnalloc(r->pool, variableValue->len + 1);
+        ngx_memcpy(resultString->data, variableValue->data, variableValue->len);
+        resultString->data[variableValue->len] = '\0';
+        resultString->len = variableValue->len;
     }
-
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "getVariableFromQueryString, VALUE: %s", resultString.data);
     return resultString;
 }
 
